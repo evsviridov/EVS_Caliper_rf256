@@ -11,24 +11,41 @@ Caliper_RF256::Caliper_RF256(void)
   rf256_addr = 0;
 }
 
-Caliper_RF256::Caliper_RF256(uint8_t addr, HardwareSerial *serial, int txPin=-1, unsigned long speed=9600)
-{
-   begin(addr, serial, txPin, speed);
-}
-
 int Caliper_RF256::begin(uint8_t addr, HardwareSerial *serial, int txPin, unsigned long speed)
 {
-  rs485_Serial = serial;
+  isHardwareSerial = true;
+  rs485_HardwareSerial = serial;
   rs485_speed  = speed;
   rs485_txPin  = txPin;
-  
-  rs485_Serial->begin(rs485_speed);
-  
+  rf256_addr = addr;
   if(rs485_txPin != -1) pinMode(rs485_txPin, OUTPUT);
   setTxMode(RX_MODE);
   
+  rs485_HardwareSerial->begin(rs485_speed);
+  while (!(*rs485_HardwareSerial)) {
+    ; // wait for serial port to connect. Needed for native USB
+  }
+  
+}
+int Caliper_RF256::begin(uint8_t addr, SoftwareSerial *serial, int txPin, unsigned long speed=9600)
+{
+  isHardwareSerial = false;
+  rs485_SoftwareSerial = serial;
+  rs485_speed  = speed;
+  rs485_txPin  = txPin;
   rf256_addr = addr;
 
+  if(rs485_txPin != -1)
+  {	 
+		pinMode(rs485_txPin, OUTPUT);
+		setTxMode(RX_MODE);
+  }
+  
+  if(!rs485_SoftwareSerial->isListening())
+  {	  
+	rs485_SoftwareSerial->begin(rs485_speed);
+	rs485_SoftwareSerial->listen();
+  }
 }
 
 int Caliper_RF256::doIDN(void)
@@ -42,11 +59,13 @@ int Caliper_RF256::doIDN(rf256_idn_struct &idnStruct)
   idnStruct = idn;
 }
 
-long Caliper_RF256::doMeas(void)
+int32_t Caliper_RF256::doMeas(void)
 {
-  doRequest(RF256_MEAS_CMD, (uint8_t *)&resultLong);
+  if(doRequest(RF256_MEAS_CMD, (uint8_t *)&resultLong) >= 0) 
+  {
   resultFloat = ((float)resultLong * 0.0001f);
  // memcpy((unsigned char *)&resultLong, rf256_buffer, sizeof(resultLong));
+  }
   return resultLong;
 }
 
@@ -56,25 +75,69 @@ float Caliper_RF256::doMeasFloat(void)
   return resultFloat;
 }
 
-void Caliper_RF256::sendSerial(unsigned char *buf, int len)
+void Caliper_RF256::sendSerial(uint8_t *buf, int len)
 {
   setTxMode(TX_MODE);
-  rs485_Serial->write(buf, len);
+  if( isHardwareSerial)
+	rs485_HardwareSerial->write(buf, len);
+  else
+	rs485_SoftwareSerial->write(buf, len);
   delayMicroseconds(2000);
- // setTxMode(RX_MODE);
+//	delay(2);
+  setTxMode(RX_MODE);
 }
 
-int Caliper_RF256::receiveSerial(unsigned char *buf, int len)
+int Caliper_RF256::receiveHardwareSerial(uint8_t *buf, int len)
 {
-  setTxMode(RX_MODE);
+	int i=0;
+ 	while (i < len)
+	{
+ 		if (rs485_HardwareSerial->available() > 0)
+		{
+			buf[i++] = rs485_HardwareSerial->read();
+		}
+	}
+}
+
+int Caliper_RF256::receiveSoftwareSerial(uint8_t *buf, int len)
+{
+	int i=0;
+	while (i < len)
+	{
+		if (rs485_SoftwareSerial->available() > 0)
+		{
+			buf[i++] = rs485_SoftwareSerial->read();
+		}
+	}
+}
+
+int Caliper_RF256::receiveSerial(uint8_t *buf, int len)
+{
+	setTxMode(RX_MODE);
+	
+	if( isHardwareSerial )
+		receiveHardwareSerial(buf, len);
+	else
+		receiveSoftwareSerial(buf, len);
+ 
+/*
   for (int i = 0; i < len; ++i)
   {
-    int j = 1000;
+    uint16_t j = 10000;
     do {
-      buf[i] = rs485_Serial->read();
-      --j;
+		if( isHardwareSerial)
+		{
+			buf[i]=rs485_HardwareSerial->read();
+		}
+		else
+		{
+			buf[i]=rs485_SoftwareSerial->read();
+		}
+       --j;
     } while ((buf[i] == 0xFF) && j);
+	if ( j == 0 ) buf[i]=(i<<4) | i;
   }
+*/ 
 }
 
 int Caliper_RF256::makeRequestString(uint8_t request_code, int *numbytes_to_send, int *numbytes_to_receive)
@@ -82,12 +145,10 @@ int Caliper_RF256::makeRequestString(uint8_t request_code, int *numbytes_to_send
   switch (request_code)
   {
     case RF256_IDN_CMD :
-      *numbytes_to_send = 2;
-      *numbytes_to_receive = 8;
+      *numbytes_to_send = 2; *numbytes_to_receive = 8;
       break;
     case RF256_MEAS_CMD :
-      *numbytes_to_send = 2;
-      *numbytes_to_receive = 4;
+      *numbytes_to_send = 2; *numbytes_to_receive = 4;
       break;
     default :
       *numbytes_to_send = *numbytes_to_receive = -1;
@@ -98,7 +159,7 @@ int Caliper_RF256::makeRequestString(uint8_t request_code, int *numbytes_to_send
   //#define RF256_PACKETMASK (0b01110000)
 
   rf256_buffer[0] = RF256_ADDRMASK & rf256_addr;
-  rf256_buffer[1] = RF256_MSGMASK | request_code;
+  rf256_buffer[1] = RF256_MSGMASK  | (request_code & 0x0F);
   return 0;
 }
 
@@ -107,14 +168,22 @@ void Caliper_RF256::setTxMode(bool isTx)
 	if (rs485_txPin != -1)
 		digitalWrite(rs485_txPin, isTx);
 }
-	
 
-void Caliper_RF256::decodeBuffer(unsigned char *buf, int numBytes, uint8_t *recBuf)
+int Caliper_RF256::decodeBuffer(uint8_t *buf, int numBytes, uint8_t *recBuf)
 {
-  for (int i = 0; i < (numBytes) ; ++i)
+	int i;
+	uint8_t isOnePacket;
+	isOnePacket = buf[0] & RF256_PACKETMASK;
+	for(i=1; i<(numBytes*2); ++i)
+	{
+		if((buf[i] & RF256_PACKETMASK) != isOnePacket)
+			return -1;
+	}
+  for (i = 0; i < (numBytes) ; ++i)
   {
-    recBuf[i] = ((buf[2*i + 1] & 0x0F) << 4) | (buf[2 * i] & 0x0F);
+    recBuf[i] = (uint8_t) ((uint8_t)(buf[2*i + 1] & (uint8_t) 0x0F) << 4) | (uint8_t)(buf[2 * i] & (uint8_t)0x0F);
   }
+  return 0;
 }
 
 int Caliper_RF256::doRequest(uint8_t code, uint8_t *recBuf)
@@ -123,7 +192,7 @@ int Caliper_RF256::doRequest(uint8_t code, uint8_t *recBuf)
   makeRequestString(code, &numbytes_to_send, &numbytes_to_receive);
   sendSerial(rf256_buffer, numbytes_to_send);
   receiveSerial(rf256_buffer, numbytes_to_receive * 2);
-  decodeBuffer(rf256_buffer, numbytes_to_receive, recBuf);
+  return decodeBuffer(rf256_buffer, numbytes_to_receive, recBuf);
 }
 
 
